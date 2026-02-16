@@ -1,0 +1,185 @@
+---
+title: "webR Shiny Performance Benchmarks"
+format:
+  html:
+    grid:
+      body-width: 1000px
+    include-in-header:
+      - text: |
+          <script>
+            window.pageLoadStartTime = performance.now();
+          </script>
+filters:
+  - shinylive
+---
+
+## Technical Overview
+
+This page is a self-contained webR-powered Shiny application. It runs R entirely in your browser using WebAssembly. This approach eliminates the need for a traditional R server (like Shiny Server or Posit Connect), making it highly portable and scalable.
+
+### How it Works
+1. **WebAssembly (Wasm)**: R is compiled to Wasm via the [webR](https://docs.r-wasm.org/webr/latest/) project.
+2. **Service Workers**: The application uses a Service Worker to manage the webR lifecycle and cache assets.
+3. **Shinylive**: This Quarto extension bundles the Shiny UI and server logic into the static page.
+
+## Performance Tester
+
+The following Shiny application will automatically run several benchmarks to evaluate the performance of R on your current machine and browser.
+
+```{shinylive-r}
+#| standalone: true
+#| viewerHeight: 800
+
+library(shiny)
+library(bslib)
+
+ui <- page_fluid(
+  theme = bs_theme(version = 5, bootswatch = "cosmo"),
+  titlePanel("webR Performance Diagnostics"),
+
+  layout_column_wrap(
+    width = 1/2,
+    card(
+      card_header("System Information"),
+      tableOutput("sys_info")
+    ),
+    card(
+      card_header("Performance Metrics"),
+      tableOutput("perf_metrics"),
+      downloadButton("download_results", "Download Results (CSV)", class = "btn-primary mt-3")
+    )
+  ),
+
+  card(
+    card_header("Execution Lag Test"),
+    p("This test measures the round-trip time for a simple R command execution."),
+    plotOutput("lag_plot", height = "300px"),
+    actionButton("run_lag_test", "Re-run Lag Test", class = "btn-secondary mt-2")
+  ),
+
+  card(
+    card_header("Technical Details for Developers"),
+    accordion(
+      accordion_panel(
+        "Load Process",
+        p("1. The browser downloads the webR Wasm binary (~25MB compressed)."),
+        p("2. The webR worker is initialized."),
+        p("3. The Shiny application code is sent to the worker."),
+        p("4. R packages are loaded from the R-Wasm repo if needed.")
+      ),
+      accordion_panel(
+        "Benchmarking Methodology",
+        p("Total Load Time: Measured using `performance.now()` from the earliest possible moment in the HTML head until the Shiny server session is initialized and sends a request back to JS."),
+        p("Lag: Calculated by recording the time before and after a series of simple R operations to gauge the responsiveness of the webR worker.")
+      )
+    )
+  ),
+
+  # JS to get browser info and timing
+  tags$script("
+    Shiny.addCustomMessageHandler('get_browser_info', function(message) {
+      const info = {
+        userAgent: navigator.userAgent,
+        hardwareConcurrency: navigator.hardwareConcurrency || 'unknown',
+        totalLoadTime: performance.now() - (window.pageLoadStartTime || 0)
+      };
+      Shiny.setInputValue('browser_info_response', info);
+    });
+  ")
+)
+
+server <- function(input, output, session) {
+
+  # Reactive values to store performance data
+  perf_data <- reactiveValues(
+    lag_samples = numeric(),
+    browser_info = list(userAgent = "Loading...", hardwareConcurrency = "unknown", totalLoadTime = NULL)
+  )
+
+  # Capture browser info via JS
+  observe({
+    session$sendCustomMessage("get_browser_info", list())
+  })
+
+  observeEvent(input$browser_info_response, {
+    perf_data$browser_info <- input$browser_info_response
+  })
+
+  # Lag testing function
+  run_lag_test <- function() {
+    samples <- 20
+    times <- numeric(samples)
+    for (i in 1:samples) {
+      start <- Sys.time()
+      # Simple operation
+      invisible(1 + 1)
+      times[i] <- as.numeric(difftime(Sys.time(), start, units = "secs")) * 1000
+    }
+    perf_data$lag_samples <- times
+  }
+
+  # Auto-run lag test on load
+  observe({
+    run_lag_test()
+  }, suspended = FALSE)
+
+  observeEvent(input$run_lag_test, {
+    run_lag_test()
+  })
+
+  output$sys_info <- renderTable({
+    data.frame(
+      Property = c("R Version", "Platform", "Browser Agent", "Hardware Concurrency"),
+      Value = c(
+        R.version.string,
+        R.version$platform,
+        perf_data$browser_info$userAgent,
+        as.character(perf_data$browser_info$hardwareConcurrency)
+      )
+    )
+  })
+
+  output$perf_metrics <- renderTable({
+    avg_lag <- if(length(perf_data$lag_samples) > 0) mean(perf_data$lag_samples) else NA
+    total_load <- if(!is.null(perf_data$browser_info$totalLoadTime)) perf_data$browser_info$totalLoadTime / 1000 else NA
+
+    data.frame(
+      Metric = c("Total Load Time (JS Start -> R Ready)", "Average Execution Lag", "Min Lag", "Max Lag"),
+      Value = c(
+        paste0(round(total_load, 2), " seconds"),
+        paste0(round(avg_lag, 2), " ms"),
+        paste0(round(min(perf_data$lag_samples), 2), " ms"),
+        paste0(round(max(perf_data$lag_samples), 2), " ms")
+      )
+    )
+  })
+
+  output$lag_plot <- renderPlot({
+    req(length(perf_data$lag_samples) > 0)
+    plot(perf_data$lag_samples, type = "b", pch = 19, col = "#007bff",
+         xlab = "Sample Number", ylab = "Lag (ms)",
+         main = "Internal R Execution Latency Samples")
+    grid()
+  })
+
+  output$download_results <- downloadHandler(
+    filename = function() {
+      paste("webr-benchmarks-", Sys.Date(), ".csv", sep = "")
+    },
+    content = function(file) {
+      df <- data.frame(
+        timestamp = Sys.time(),
+        total_load_time_sec = if(!is.null(perf_data$browser_info$totalLoadTime)) perf_data$browser_info$totalLoadTime / 1000 else NA,
+        avg_lag_ms = mean(perf_data$lag_samples),
+        user_agent = perf_data$browser_info$userAgent,
+        cores = perf_data$browser_info$hardwareConcurrency,
+        r_version = R.version.string,
+        platform = R.version$platform
+      )
+      write.csv(df, file, row.names = FALSE)
+    }
+  )
+}
+
+shinyApp(ui = ui, server = server)
+```
